@@ -1,0 +1,256 @@
+heat_template_version: 2013-05-23
+
+description: >
+    HEAT template for homework assignment.
+
+parameters:
+  key_name_server:
+    type: string
+    default: generated key name for server
+  key_name_db:
+    type: string
+    default: generated key name for db
+  net1:
+    type: string
+    description: (existing) network for the server to be created
+    default: private-net1
+    constraints:
+      - custom_constraint: neutron.network
+  image:
+    type: string
+    label: Image name or ID
+    description: image to be used
+    default: fedora-20.x86_64
+
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of flavor to be used
+    default: m1.small
+
+  private_net_id:
+    type: string
+    description: ID of private network into which servers get deployed
+    default: private-net
+
+  private_net_cidr:
+    type: string
+    description: Private network address (CIDR notation)
+    default: 10.0.10.0/24
+
+  private_net_pool_start:
+    type: string
+    description: Start of private network IP address allocation pool
+    default: 10.0.10.2
+
+  private_net_pool_end:
+    type: string
+    description: End of private network IP address allocation pool
+    default: 10.0.10.50
+
+  db_name:
+    type: string
+    description: WordPress database name
+    default: wordpress
+    constraints:
+      - length: { min: 1, max: 64 }
+        description: db_name must be between 1 and 64 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+    
+  db_username:
+    type: string
+    description: The WordPress database admin account username
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 16 }
+        description: db_username must be between 1 and 16 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        
+  db_password:
+    type: string
+    description: The WordPress database admin account password
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_password must contain only alphanumeric characters
+
+  db_root_password:
+    type: string
+    description: Root password for MySQL
+    default: admin
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_root_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_root_password must contain only alphanumeric characters
+
+resources:
+
+  private_net:
+    type: OS::Neutron::Net
+    properties: 
+      name: {get_param: private_net_id}
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: {get_param: private_net_id}
+      network: {get_resource: private_net}
+      cidr: {get_param: private_net_cidr}
+      dns_nameservers: ["8.8.8.8"]
+      allocation_pools:
+        - start: { get_param: private_net_pool_start }
+          end: { get_param:  private_net_pool_end }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: {get_param: net1}
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+  generated_key_pair_db:
+    type: OS::Nova::KeyPair
+    properties:
+      name: {get_param: key_name_db}
+      save_private_key: True
+
+  generated_key_pair_server:
+    type: OS::Nova::KeyPair
+    properties:
+      name: {get_param: key_name_server}
+      save_private_key: True
+ 
+  DatabaseServer:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_resource: generated_key_pair_server }
+      networks:
+        - port: {get_resource: DatabaseServer_port}
+      user_data:
+        str_replace:
+          template: |
+                    #!/bin/bash -v
+                    sed -i "s/metalink=https/metalink=http/" /etc/yum.repos.d/*
+                    yum -y install mariadb mariadb-server
+                    touch /var/log/mariadb/mariadb.log
+                    chown mysql.mysql /var/log/mariadb/mariadb.log
+                    systemctl start mariadb.service
+                    # Setup MySQL root password and create a user
+                    mysqladmin -u root password db_rootpassword
+                    cat << EOF | mysql -u root --password=db_rootpassword
+                    CREATE DATABASE db_name;
+                    GRANT ALL PRIVILEGES ON db_name.* TO "db_user"@"%"
+                    IDENTIFIED BY "db_password";
+                    FLUSH PRIVILEGES;
+                    EXIT
+                    EOF
+          params:
+            db_rootpassword: { get_param: db_root_password }
+            db_name: { get_param: db_name }
+            db_user: { get_param: db_username }
+            db_password: { get_param: db_password }
+
+  DatabaseServer_port:
+    type: OS::Neutron::Port
+    properties:
+      network: {get_resource: private_net}
+      fixed_ips:
+        - subnet_id: {get_resource: private_subnet}
+      security_groups: [{ get_resource: db_security_group }]
+
+  WebServer:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_resource: generated_key_pair_server }
+      networks:
+        - port: {get_resource: WebServer_port}
+      user_data:
+        str_replace:
+          template: '#!/bin/bash -v
+
+            sed -i "s/metalink=https/metalink=http/" /etc/yum.repos.d/*
+
+            yum -y install httpd wordpress
+
+            sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+
+            sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+
+            sed -i s/database_name_here/db_name/ /etc/wordpress/wp-config.php
+
+            sed -i s/username_here/db_user/      /etc/wordpress/wp-config.php
+
+            sed -i s/password_here/db_password/  /etc/wordpress/wp-config.php
+
+            sed -i s/localhost/db_ipaddr/        /etc/wordpress/wp-config.php
+            
+            setenforce 0 # Otherwise net traffic with DB is disabled
+
+            
+
+            systemctl start httpd.service
+
+            '
+          params:
+              db_rootpassword: { get_param: db_root_password }
+              db_name: { get_param: db_name }
+              db_user: { get_param: db_username }
+              db_password: { get_param: db_password }
+              db_ipaddr: { get_attr: [DatabaseServer, networks, private-net, 0] }
+
+
+  WebServer_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+      security_groups: [{ get_resource: server_security_group }]
+
+  server_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: net1 }
+      port_id: { get_resource: WebServer_port }
+
+
+  server_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Add security group rules for server
+      name: security-group
+      rules:
+      - {port_range_max: 22, port_range_min: 22, protocol: tcp, remote_ip_prefix: 0.0.0.0/0}
+      - {port_range_max: 80, port_range_min: 80, protocol: tcp, remote_ip_prefix: 0.0.0.0/0}
+      - {protocol: icmp, remote_ip_prefix: 0.0.0.0/0}
+      
+  db_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: sec-group-db
+      rules:
+      - {port_range_max: 3306, port_range_min: 3306, protocol: tcp,remote_ip_prefix: 10.0.10.0/24}
+
+outputs:
+    
+  WebsiteURL:
+    description: URL for Wordpress wiki
+    value:
+      str_replace:
+        template: http://host/wordpress
+        params:
+          host: { get_attr: [server_floating_ip, floating_ip_address] }
